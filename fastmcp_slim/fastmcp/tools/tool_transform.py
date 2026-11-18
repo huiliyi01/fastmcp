@@ -9,7 +9,7 @@ from typing import Annotated, Any, Literal, cast
 
 import mcp_types
 from mcp_types import ToolAnnotations
-from pydantic import ConfigDict
+from pydantic import ConfigDict, PrivateAttr, model_validator
 from pydantic import ValidationError as PydanticValidationError
 from pydantic.fields import Field
 from pydantic.functional_validators import BeforeValidator
@@ -314,6 +314,35 @@ class TransformedTool(Tool):
     ]  # Always present, handles arg transformation
     transform_args: dict[str, ArgTransform]
 
+    _fn_params_without_defaults: frozenset[str] = PrivateAttr(default=frozenset())
+
+    @model_validator(mode="after")
+    def _compute_fn_params_without_defaults(self) -> TransformedTool:
+        """Find parameters the executed function cannot default itself.
+
+        The forwarding function only takes **kwargs, so for pure transforms
+        this is empty and the parent applies every default. A transform_fn
+        may redeclare a parent's optional parameter without a default; those
+        must be filled from the advertised schema default or an omitted call
+        fails with a missing-argument TypeError.
+        """
+        try:
+            signature = inspect.signature(self.fn)
+        except (TypeError, ValueError):
+            return self
+        self._fn_params_without_defaults = frozenset(
+            param.name
+            for param in signature.parameters.values()
+            if param.default is inspect.Parameter.empty
+            and param.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        )
+        return self
+
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
         """Run the tool with context set for forward() functions.
 
@@ -351,6 +380,16 @@ class TransformedTool(Tool):
                 continue
 
             arguments[new_name] = transform.default
+
+        # Parameters the transform_fn redeclared without a default still need
+        # the schema default they advertise (inherited from the parent);
+        # omitting one must not fail the call with a TypeError.
+        for param_name in self._fn_params_without_defaults:
+            if param_name in arguments:
+                continue
+            param_schema = properties.get(param_name)
+            if param_schema is not None and "default" in param_schema:
+                arguments[param_name] = param_schema["default"]
 
         token = _current_tool.set(self)
         try:
@@ -568,6 +607,34 @@ class TransformedTool(Tool):
                 final_schema = cls._merge_schema_with_precedence(
                     parsed_fn.input_schema, schema
                 )
+
+            # The transform_fn is the implementation: where it declares its
+            # own default for a parameter, that default is what an omitted
+            # call receives, so the schema must advertise it rather than the
+            # parent's. Explicit ArgTransform defaults keep precedence.
+            fn_defaults = {
+                prop_name: prop["default"]
+                for prop_name, prop in parsed_fn.input_schema.get(
+                    "properties", {}
+                ).items()
+                if "default" in prop
+            }
+            transform_defaulted = set()
+            for orig_name, transform in transform_args.items():
+                if transform.default is NotSet:
+                    continue
+                new_name = transform.name if transform.name is not NotSet else orig_name
+                if not isinstance(new_name, str):
+                    new_name = orig_name
+                transform_defaulted.add(new_name)
+            schema_props = final_schema.get("properties", {})
+            schema_required = final_schema.get("required", [])
+            for param_name, fn_default in fn_defaults.items():
+                if param_name in transform_defaulted or param_name not in schema_props:
+                    continue
+                schema_props[param_name]["default"] = fn_default
+                if param_name in schema_required:
+                    schema_required.remove(param_name)
 
         # Additional validation: check for naming conflicts after transformation
         if transform_args:

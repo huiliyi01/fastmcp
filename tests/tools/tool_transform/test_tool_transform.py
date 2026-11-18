@@ -192,6 +192,65 @@ async def test_transform_fn_default_is_not_replaced_by_serialized_schema_default
     assert result.structured_content == {"result": "using token s3cr3t"}
 
 
+async def test_transform_fn_param_without_default_keeps_parent_schema_default():
+    """A transform_fn that redeclares a parent's optional parameter without a
+    default must not fail on an omitted call: the advertised schema default
+    is supplied."""
+
+    @Tool.from_function
+    def connect(token: str = "parent-default") -> str:
+        return token
+
+    async def custom(token: str) -> str:
+        return f"using token {token}"
+
+    transformed = Tool.from_tool(connect, transform_fn=custom)
+    assert transformed.parameters["properties"]["token"]["default"] == "parent-default"
+    assert "token" not in transformed.parameters["required"]
+    result = await transformed.run(arguments={})
+    assert result.structured_content == {"result": "using token parent-default"}
+
+
+async def test_transform_fn_own_default_is_reflected_in_schema():
+    """When the transform_fn declares its own default for a parameter, the
+    schema advertises the function's default — that is what an omitted call
+    receives — not the parent's."""
+
+    @Tool.from_function
+    def connect(token: str = "parent-default") -> str:
+        return token
+
+    async def custom(token: str = "fn-default") -> str:
+        return f"using token {token}"
+
+    transformed = Tool.from_tool(connect, transform_fn=custom)
+    assert transformed.parameters["properties"]["token"]["default"] == "fn-default"
+    assert "token" not in transformed.parameters["required"]
+    result = await transformed.run(arguments={})
+    assert result.structured_content == {"result": "using token fn-default"}
+
+
+async def test_arg_transform_default_takes_precedence_over_fn_default():
+    """An explicit ArgTransform default still wins over the transform_fn's
+    own default, in both the schema and the executed call."""
+
+    @Tool.from_function
+    def connect(token: str = "parent-default") -> str:
+        return token
+
+    async def custom(token: str = "fn-default") -> str:
+        return f"using token {token}"
+
+    transformed = Tool.from_tool(
+        connect,
+        transform_fn=custom,
+        transform_args={"token": ArgTransform(default="arg-default")},
+    )
+    assert transformed.parameters["properties"]["token"]["default"] == "arg-default"
+    result = await transformed.run(arguments={})
+    assert result.structured_content == {"result": "using token arg-default"}
+
+
 def test_tool_change_arg_name(add_tool):
     new_tool = Tool.from_tool(
         add_tool, transform_args={"old_x": ArgTransform(name="new_x")}
